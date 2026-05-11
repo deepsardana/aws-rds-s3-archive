@@ -1,1 +1,225 @@
+name: RDS Archive Dry Run (No Delete)
 
+on:
+  workflow_dispatch:        # manual trigger only for dry run
+    inputs:
+      dry_run:
+        description: 'Dry run mode (no delete, no optimize)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  archive-dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Install MySQL client & AWS CLI
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mysql-client
+          pip install awscli --quiet
+
+      - name: Print dry run mode
+        run: |
+          echo "================================================"
+          echo "  DRY RUN MODE: ${{ github.event.inputs.dry_run }}"
+          echo "  ✅ Archive to S3 → YES"
+          echo "  ${{ github.event.inputs.dry_run == 'true' && '🔒 DELETE rows   → SKIPPED' || '⚠️  DELETE rows   → WILL RUN' }}"
+          echo "  ${{ github.event.inputs.dry_run == 'true' && '🔒 OPTIMIZE TABLE → SKIPPED' || '⚠️  OPTIMIZE TABLE → WILL RUN' }}"
+          echo "================================================"
+
+      - name: Check how many rows will be archived
+        run: |
+          COUNT=$(mysql -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            ${{ secrets.DB_NAME }} -se \
+            "SELECT COUNT(*) FROM your_table
+             WHERE created_at < NOW() - INTERVAL 30 DAY;")
+
+          echo "================================================"
+          echo "  Rows older than 30 days: $COUNT"
+          echo "================================================"
+
+          if [ "$COUNT" -eq "0" ]; then
+            echo "SKIP=true"  >> $GITHUB_ENV
+          else
+            echo "SKIP=false" >> $GITHUB_ENV
+          fi
+          echo "ROW_COUNT=$COUNT" >> $GITHUB_ENV
+
+      - name: Preview — which rows will be archived (sample 10)
+        if: env.SKIP == 'false'
+        run: |
+          echo "📋 Sample of rows that WOULD be archived (first 10):"
+          mysql -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            ${{ secrets.DB_NAME }} -e \
+            "SELECT * FROM your_table
+             WHERE created_at < NOW() - INTERVAL 30 DAY
+             ORDER BY created_at ASC
+             LIMIT 10;"
+
+          echo ""
+          echo "📋 Oldest row:"
+          mysql -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            ${{ secrets.DB_NAME }} -e \
+            "SELECT * FROM your_table
+             ORDER BY created_at ASC
+             LIMIT 1;"
+
+          echo ""
+          echo "📋 Newest row that would be deleted:"
+          mysql -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            ${{ secrets.DB_NAME }} -e \
+            "SELECT * FROM your_table
+             WHERE created_at < NOW() - INTERVAL 30 DAY
+             ORDER BY created_at DESC
+             LIMIT 1;"
+
+      - name: Export old data to S3 (runs in both dry run and real)
+        if: env.SKIP == 'false'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          ARCHIVE_DATE=$(date +%Y-%m-%d)
+          ARCHIVE_MONTH=$(date +%Y-%m)
+
+          # Separate folder for dry run archives so they don't mix with real
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            S3_KEY="archive-dryrun/your_table/${ARCHIVE_MONTH}/your_table_${ARCHIVE_DATE}.sql.gz"
+          else
+            S3_KEY="archive/your_table/${ARCHIVE_MONTH}/your_table_${ARCHIVE_DATE}.sql.gz"
+          fi
+
+          echo "📦 Exporting to S3: $S3_KEY"
+
+          mysqldump -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            ${{ secrets.DB_NAME }} your_table \
+            --where="created_at < NOW() - INTERVAL 30 DAY" \
+            --single-transaction \
+            --quick \
+            | gzip > /tmp/your_table_${ARCHIVE_DATE}.sql.gz
+
+          FILE_SIZE=$(du -sh /tmp/your_table_${ARCHIVE_DATE}.sql.gz | cut -f1)
+
+          aws s3 cp /tmp/your_table_${ARCHIVE_DATE}.sql.gz \
+            s3://${{ secrets.S3_BUCKET }}/${S3_KEY}
+
+          echo "S3_KEY=${S3_KEY}"             >> $GITHUB_ENV
+          echo "ARCHIVE_DATE=${ARCHIVE_DATE}" >> $GITHUB_ENV
+          echo "FILE_SIZE=${FILE_SIZE}"       >> $GITHUB_ENV
+          echo "✅ Archive uploaded: $FILE_SIZE"
+
+      - name: Verify S3 archive
+        if: env.SKIP == 'false'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          SIZE=$(aws s3 ls s3://${{ secrets.S3_BUCKET }}/${{ env.S3_KEY }} \
+            | awk '{print $3}')
+
+          if [ -z "$SIZE" ] || [ "$SIZE" -eq "0" ]; then
+            echo "❌ Archive missing or empty! Aborting."
+            exit 1
+          fi
+
+          echo "✅ S3 archive verified (size: $SIZE bytes)"
+
+      # ──────────────────────────────────────────────
+      # DRY RUN = true  → just print what WOULD happen
+      # ──────────────────────────────────────────────
+      - name: Dry Run — Show what WOULD be deleted
+        if: env.SKIP == 'false' && github.event.inputs.dry_run == 'true'
+        run: |
+          echo "================================================"
+          echo "  🔒 DRY RUN — DELETE SKIPPED"
+          echo "  The following would be deleted in real run:"
+          echo "================================================"
+          mysql -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            ${{ secrets.DB_NAME }} -e \
+            "SELECT
+               COUNT(*)                    AS total_rows_to_delete,
+               MIN(created_at)             AS oldest_row,
+               MAX(created_at)             AS newest_row_to_delete,
+               ROUND(COUNT(*) / 5000) + 1  AS estimated_batches
+             FROM your_table
+             WHERE created_at < NOW() - INTERVAL 30 DAY;"
+          echo "================================================"
+          echo "  🔒 OPTIMIZE TABLE also SKIPPED in dry run"
+          echo "================================================"
+
+      # ──────────────────────────────────────────────
+      # DRY RUN = false → actually delete
+      # ──────────────────────────────────────────────
+      - name: Delete old rows in batches (oldest first)
+        if: env.SKIP == 'false' && github.event.inputs.dry_run == 'false'
+        run: |
+          TOTAL=0
+          BATCH=0
+
+          while true; do
+            ROWS=$(mysql -h ${{ secrets.DB_HOST }} \
+              -u ${{ secrets.DB_USER }} \
+              -p${{ secrets.DB_PASSWORD }} \
+              ${{ secrets.DB_NAME }} -se \
+              "DELETE FROM your_table
+               WHERE created_at < NOW() - INTERVAL 30 DAY
+               ORDER BY created_at ASC
+               LIMIT 5000;
+               SELECT ROW_COUNT();")
+
+            ROWS=$(echo "$ROWS" | tail -1)
+            TOTAL=$((TOTAL + ROWS))
+            BATCH=$((BATCH + 1))
+
+            echo "Batch $BATCH: Deleted $ROWS rows (Total: $TOTAL)"
+
+            [ "$ROWS" -eq "0" ] && break
+            sleep 1
+          done
+
+          echo "TOTAL_DELETED=$TOTAL" >> $GITHUB_ENV
+
+      - name: Optimize table
+        if: env.SKIP == 'false' && github.event.inputs.dry_run == 'false'
+        run: |
+          mysql -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            ${{ secrets.DB_NAME }} -e \
+            "OPTIMIZE TABLE your_table;"
+          echo "✅ OPTIMIZE TABLE complete"
+
+      - name: Table size report
+        run: |
+          mysql -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            ${{ secrets.DB_NAME }} -e \
+            "SELECT
+               table_name,
+               ROUND(data_length / 1024 / 1024, 2)  AS data_mb,
+               ROUND(index_length / 1024 / 1024, 2) AS index_mb,
+               ROUND(data_free / 1024 / 1024, 2)    AS free_mb
+             FROM information_schema.tables
+             WHERE table_schema = '${{ secrets.DB_NAME }}'
+               AND table_name = 'your_table';"
