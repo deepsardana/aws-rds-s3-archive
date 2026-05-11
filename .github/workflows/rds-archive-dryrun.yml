@@ -107,7 +107,6 @@ jobs:
           echo "📦 Exporting to S3: $S3_KEY"
 
           mysqldump \
-            --column-statistics=0 \
             -h ${{ secrets.DB_HOST }} \
             -u ${{ secrets.DB_USER }} \
             -p${{ secrets.DB_PASSWORD }} \
