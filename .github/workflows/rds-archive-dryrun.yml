@@ -21,7 +21,7 @@ jobs:
       - name: Install MySQL client & AWS CLI
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y mysql-client
+          sudo apt-get install -y mariadb-client
           pip install awscli --quiet
 
       - name: Print dry run mode
@@ -119,8 +119,9 @@ jobs:
 
           FILE_SIZE=$(du -sh /tmp/your_table_${ARCHIVE_DATE}.sql.gz | cut -f1)
 
-          aws s3 cp /tmp/your_table_${ARCHIVE_DATE}.sql.gz \
-            s3://${{ secrets.S3_BUCKET }}/${S3_KEY}
+          aws s3 cp \
+              "/tmp/your_table_${ARCHIVE_DATE}.sql.gz" \
+              "s3://${{ secrets.S3_BUCKET }}/${S3_KEY}"
 
           echo "S3_KEY=${S3_KEY}"             >> $GITHUB_ENV
           echo "ARCHIVE_DATE=${ARCHIVE_DATE}" >> $GITHUB_ENV
